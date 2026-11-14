@@ -1,0 +1,177 @@
+name: Rafiq Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'تشغيل يدوي (لا مدخلات مطلوبة)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build APKs and the verified Muaalem model pack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Record toolchain
+        run: |
+          flutter --version
+          java -version
+          python3 --version
+
+      - name: Warn about stale nested copies of the project
+        run: |
+          nested=$(find . -mindepth 2 -maxdepth 3 -name pubspec.yaml -not -path './.git/*' -not -path './.dart_tool/*' -not -path './build/*' -not -path './android/*' || true)
+          if [ -n "$nested" ]; then
+            echo "::warning::Nested Flutter project copies were found and are excluded from analysis, but they should be deleted from the repository: $nested"
+          else
+            echo 'No nested project copies found.'
+          fi
+
+      - name: Fetch and verify the Muaalem-mini q8 model (public, no token; AGPL-3.0 weights)
+        run: python3 scripts/fetch_muaalem.py --variant q8 --out assets/models
+
+      - name: Cache key for the model pack
+        id: model-hash
+        run: echo "sha=$(python3 -c "import json;print(json.load(open('assets/models/model_manifest.json'))['sha256'][:16])")" >> "$GITHUB_OUTPUT"
+
+      - name: "Upload the model pack (public, AGPL-3.0, see NOTICE.md)"
+        uses: actions/upload-artifact@v6
+        with:
+          name: rafiq-muaalem-q8-pack-${{ steps.model-hash.outputs.sha }}
+          path: |
+            assets/models/muaalem_q8.onnx
+            assets/models/model_manifest.json
+            assets/models/phoneme_vocab.json
+            assets/models/preprocessor_config.json
+            assets/models/NOTICE.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Generate Android platform files
+        run: flutter create --platforms=android --project-name rafiq_app --org com.rafiq .
+
+      - name: Patch Android permissions, SDK levels, resources and stable signing support
+        run: python3 scripts/patch_android.py
+
+      - name: Install stable release keystore when configured
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ]; then
+            test -n "$RELEASE_STORE_PASSWORD" || { echo '::error::RELEASE_STORE_PASSWORD is required with RELEASE_KEYSTORE_BASE64'; exit 1; }
+            test -n "$RELEASE_KEY_ALIAS" || { echo '::error::RELEASE_KEY_ALIAS is required with RELEASE_KEYSTORE_BASE64'; exit 1; }
+            test -n "$RELEASE_KEY_PASSWORD" || { echo '::error::RELEASE_KEY_PASSWORD is required with RELEASE_KEYSTORE_BASE64'; exit 1; }
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > android/app/rafiq-release.keystore
+            test -s android/app/rafiq-release.keystore
+            echo 'Stable signing keystore configured.'
+          else
+            echo '::warning::Stable release signing secrets are not configured. APKs use the runner debug key; subsequent builds may not install as an update on top of a previous APK.'
+          fi
+
+      - name: Verify Android audio and notification configuration
+        run: |
+          manifest=android/app/src/main/AndroidManifest.xml
+          test -f "$manifest"
+          grep -q 'android.permission.RECORD_AUDIO' "$manifest"
+          grep -q 'android.permission.MODIFY_AUDIO_SETTINGS' "$manifest"
+          if [ -f android/app/build.gradle.kts ]; then f=android/app/build.gradle.kts; else f=android/app/build.gradle; fi
+          grep -Eq 'isCoreLibraryDesugaringEnabled = true|coreLibraryDesugaringEnabled true' "$f"
+          grep -q 'desugar_jdk_libs' "$f"
+          cat assets/models/model_manifest.json
+          if grep -q -- 'assets/models/' pubspec.yaml; then
+            echo '::error::Model files must not be embedded as Flutter assets; they are delivered as a separate model pack.'
+            exit 1
+          fi
+
+      - name: Preflight recorder dependency verifier files
+        run: |
+          test -f scripts/verify_record_dependencies.py || { echo '::error::scripts/verify_record_dependencies.py is missing at repository root.'; exit 1; }
+          test -f test/test_verify_record_dependencies.py || { echo '::error::test/test_verify_record_dependencies.py is missing at repository root.'; exit 1; }
+          echo 'Recorder dependency verifier files are present.'
+
+      - name: Validate model downloader source and tests
+        run: |
+          python3 -m pip install --quiet numpy onnxruntime
+          python3 -m pip install --quiet quran-transcript transformers
+          python3 -m py_compile scripts/fetch_muaalem.py scripts/build_qps_reference.py tools/scoring_ref/scoring.py tools/scoring_ref/calibrate.py scripts/patch_android.py scripts/verify_record_dependencies.py test/test_fetch_models.py test/test_resolve_model_revision.py test/test_patch_android.py test/test_verify_record_dependencies.py test/test_analysis_options.py test/test_engine_wiring.py
+          python3 -m unittest discover -s test -p 'test_*.py' -v
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Verify compatible resolved recorder dependencies
+        run: |
+          flutter pub deps --json > "$RUNNER_TEMP/rafiq-pub-deps.json"
+          python3 scripts/verify_record_dependencies.py "$RUNNER_TEMP/rafiq-pub-deps.json"
+
+      - name: Format Dart source
+        run: dart format lib test
+
+      - name: Analyze Dart source
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Run unit and widget tests
+        run: flutter test --reporter expanded
+
+      - name: Build lightweight release APKs (model stored separately, developer telemetry enabled)
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: >-
+          flutter build apk --release --split-per-abi
+          --target-platform android-arm,android-arm64
+          --dart-define=RAFIQ_ENABLE_TELEMETRY=true
+
+      - name: Generate per-APK checksums
+        run: |
+          cd build/app/outputs/flutter-apk
+          sha256sum app-arm64-v8a-release.apk > app-arm64-v8a-release.apk.sha256
+          sha256sum app-armeabi-v7a-release.apk > app-armeabi-v7a-release.apk.sha256
+
+      - name: Upload Android ARM64 APK (recommended for most phones)
+        uses: actions/upload-artifact@v6
+        with:
+          name: rafiq-v0.6.5-arm64-apk
+          path: |
+            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Android ARM32 APK (for older devices)
+        uses: actions/upload-artifact@v6
+        with:
+          name: rafiq-v0.6.5-arm32-apk
+          path: |
+            build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+            build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk.sha256
+          if-no-files-found: error
+          retention-days: 30

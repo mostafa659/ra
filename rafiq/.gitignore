@@ -1,0 +1,22 @@
+.dart_tool/
+.packages
+.pub-cache/
+build/
+coverage/
+.flutter-plugins
+.flutter-plugins-dependencies
+assets/models/*.onnx
+assets/models/tokens.txt
+assets/models/quran_phoneme_words.json
+assets/models/model_manifest.json
+assets/models/*.part
+
+# Python build/test cache
+__pycache__/
+*.py[cod]
+
+# Never commit release-signing credentials
+android/key.properties
+android/app/rafiq-release.keystore
+*.jks
+*.keystore

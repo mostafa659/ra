@@ -1,0 +1,12 @@
+gradle-wrapper.jar.bak
+/gradlew.bat.bak
+/local.properties
+/.gradle
+/captures/
+.cxx/
+*.iml
+GeneratedPluginRegistrant.*
+key.properties
+app/rafiq-release.keystore
+*.jks
+*.keystore
